@@ -184,6 +184,15 @@ def insert_to_supabase(voters, pdf_upload_id, supabase_url, supabase_key):
 def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
     logger.info(f"Background job started for: {pdf_upload_id}")
     tmp_path = None
+
+    # Tracking stats
+    total_in_pdf = 0
+    total_inserted = 0
+    total_duplicates = 0
+    total_errors = 0
+    duplicate_details = []
+    error_details = []
+
     try:
         response = requests.get(pdf_url, timeout=120)
         response.raise_for_status()
@@ -209,12 +218,12 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
             total_pages = len(pdf.pages)
         logger.info(f"Total pages: {total_pages}")
 
-        total_inserted = 0
         current_precinct = ''
         province = ''
         city = ''
         barangay = ''
-        BATCH_SIZE = 30  # smaller batches = less memory
+        BATCH_SIZE = 30
+        PAGE_INSERT_SIZE = 100
 
         for batch_start in range(0, total_pages, BATCH_SIZE):
             batch_end = min(batch_start + BATCH_SIZE, total_pages)
@@ -293,43 +302,88 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                             'pdf_upload_id': pdf_upload_id
                         })
 
-            # Insert batch to Supabase
-            for i in range(0, len(batch_voters), 100):
-                insert_batch = batch_voters[i:i + 100]
+            # Insert batch with duplicate tracking
+            for i in range(0, len(batch_voters), PAGE_INSERT_SIZE):
+                insert_batch = batch_voters[i:i + PAGE_INSERT_SIZE]
+                total_in_pdf += len(insert_batch)
+
                 try:
+                    # Try bulk insert first
                     res = requests.post(
                         f"{supabase_url}/rest/v1/voters_list",
                         json=insert_batch,
                         headers=headers,
                         timeout=30
                     )
+
                     if res.status_code in (200, 201):
+                        # All inserted successfully
                         total_inserted += len(insert_batch)
+
+                    elif res.status_code == 409:
+                        # Bulk had duplicates — insert one by one
+                        for voter in insert_batch:
+                            try:
+                                single = requests.post(
+                                    f"{supabase_url}/rest/v1/voters_list",
+                                    json=voter,
+                                    headers=headers,
+                                    timeout=10
+                                )
+                                if single.status_code in (200, 201):
+                                    total_inserted += 1
+                                elif single.status_code == 409:
+                                    total_duplicates += 1
+                                    # Only store first 100 duplicates
+                                    if len(duplicate_details) < 100:
+                                        duplicate_details.append({
+                                            "precinct": voter.get("precinct_no"),
+                                            "voter_no": voter.get("voter_no"),
+                                            "name": f"{voter.get('last_name')}, {voter.get('first_name')}"
+                                        })
+                                else:
+                                    total_errors += 1
+                                    if len(error_details) < 50:
+                                        error_details.append({
+                                            "precinct": voter.get("precinct_no"),
+                                            "voter_no": voter.get("voter_no"),
+                                            "error": single.text[:100]
+                                        })
+                            except Exception as e:
+                                total_errors += 1
                     else:
-                        logger.error(f"Insert error: {res.status_code} - {res.text[:200]}")
+                        total_errors += len(insert_batch)
+                        if len(error_details) < 50:
+                            error_details.append({
+                                "batch": f"{batch_start}-{batch_end}",
+                                "error": res.text[:100]
+                            })
+
                 except Exception as e:
-                    logger.error(f"Insert exception: {str(e)}")
+                    total_errors += len(insert_batch)
+                    if len(error_details) < 50:
+                        error_details.append({
+                            "batch": f"{batch_start}-{batch_end}",
+                            "error": str(e)
+                        })
 
-            logger.info(f"Pages {batch_start}-{batch_end} done — total: {total_inserted}")
+            logger.info(f"Pages {batch_start}-{batch_end} done — inserted: {total_inserted} dupes: {total_duplicates}")
 
-            # Force garbage collection
+            # Free memory
             del batch_voters
             import gc
             gc.collect()
 
-        # Mark completed
-        requests.patch(
-            f"{supabase_url}/rest/v1/pdf_uploads?id=eq.{pdf_upload_id}",
-            json={
-                "status": "completed",
-                "records_count": total_inserted,
-                "progress": 1.0,
-            },
-            headers=headers,
-            timeout=30
-        )
-        logger.info(f"COMPLETE! Total inserted: {total_inserted}")
-# Generate CSV after all voters inserted
+        # Log final report
+        logger.info(f"""
+EXTRACTION REPORT:
+  Total in PDF:   {total_in_pdf}
+  Inserted:       {total_inserted}
+  Duplicates:     {total_duplicates}
+  Errors:         {total_errors}
+        """)
+
+        # Generate CSV
         try:
             logger.info("Generating CSV...")
             csv_headers = "precinct_no,voter_no,last_name,first_name,middle_name,address,barangay,city,province,voter_category\n"
@@ -393,19 +447,45 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
 
         except Exception as e:
             logger.error(f"CSV generation error: {str(e)}")
-            
+
+        # Update pdf_uploads with full report
+        requests.patch(
+            f"{supabase_url}/rest/v1/pdf_uploads?id=eq.{pdf_upload_id}",
+            json={
+                "status": "completed",
+                "records_count": total_inserted,
+                "progress": 1.0,
+                "total_in_pdf": total_in_pdf,
+                "total_inserted": total_inserted,
+                "total_duplicates": total_duplicates,
+                "total_errors": total_errors,
+                "duplicate_details": duplicate_details,
+                "error_details": error_details,
+            },
+            headers=headers,
+            timeout=30
+        )
+
+        logger.info(f"COMPLETE! Inserted: {total_inserted} Dupes: {total_duplicates}")
+
     except Exception as e:
         logger.error(f"Background job error: {str(e)}")
         try:
-            headers = {
-                "apikey": supabase_key,
-                "Authorization": f"Bearer {supabase_key}",
-                "Content-Type": "application/json"
-            }
             requests.patch(
                 f"{supabase_url}/rest/v1/pdf_uploads?id=eq.{pdf_upload_id}",
-                json={"status": "error", "error_message": str(e)},
-                headers=headers,
+                json={
+                    "status": "error",
+                    "error_message": str(e),
+                    "total_in_pdf": total_in_pdf,
+                    "total_inserted": total_inserted,
+                    "total_duplicates": total_duplicates,
+                    "total_errors": total_errors,
+                },
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "application/json"
+                },
                 timeout=10
             )
         except:
