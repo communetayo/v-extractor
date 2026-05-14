@@ -329,7 +329,71 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
             timeout=30
         )
         logger.info(f"COMPLETE! Total inserted: {total_inserted}")
+# Generate CSV after all voters inserted
+        try:
+            logger.info("Generating CSV...")
+            csv_headers = "precinct_no,voter_no,last_name,first_name,middle_name,address,barangay,city,province,voter_category\n"
+            csv_rows = []
+            offset = 0
 
+            while True:
+                res = requests.get(
+                    f"{supabase_url}/rest/v1/voters_list",
+                    params={
+                        "pdf_upload_id": f"eq.{pdf_upload_id}",
+                        "order": "precinct_no.asc,voter_no.asc",
+                        "limit": 1000,
+                        "offset": offset,
+                        "select": "precinct_no,voter_no,last_name,first_name,middle_name,address,barangay,city,province,voter_category"
+                    },
+                    headers=headers,
+                    timeout=30
+                )
+                if res.status_code != 200:
+                    break
+                batch = res.json()
+                if not batch:
+                    break
+                for v in batch:
+                    csv_rows.append(",".join([
+                        f'"{v.get("precinct_no","")}"',
+                        f'"{v.get("voter_no","")}"',
+                        f'"{v.get("last_name","")}"',
+                        f'"{v.get("first_name","")}"',
+                        f'"{v.get("middle_name","")}"',
+                        f'"{v.get("address","")}"',
+                        f'"{v.get("barangay","")}"',
+                        f'"{v.get("city","")}"',
+                        f'"{v.get("province","")}"',
+                        f'"{v.get("voter_category","")}"',
+                    ]))
+                offset += 1000
+                if len(batch) < 1000:
+                    break
+
+            csv_content = csv_headers + "\n".join(csv_rows)
+            csv_filename = f"converted_{pdf_upload_id}.csv"
+
+            upload_res = requests.post(
+                f"{supabase_url}/storage/v1/object/csv-exports/{csv_filename}",
+                data=csv_content.encode('utf-8'),
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {supabase_key}",
+                    "Content-Type": "text/csv",
+                    "x-upsert": "true"
+                },
+                timeout=60
+            )
+
+            if upload_res.status_code in (200, 201):
+                logger.info(f"CSV ready: {csv_filename} with {len(csv_rows)} rows")
+            else:
+                logger.error(f"CSV error: {upload_res.text[:200]}")
+
+        except Exception as e:
+            logger.error(f"CSV generation error: {str(e)}")
+            
     except Exception as e:
         logger.error(f"Background job error: {str(e)}")
         try:
