@@ -136,7 +136,44 @@ class ExtractRequest(BaseModel):
 @app.get("/")
 def health_check():
     return {"status": "ok", "service": "v-extractor"}
+class TestExtractRequest(BaseModel):
+    pdf_url: str
 
+@app.post("/test-extract")
+async def test_extract(req: TestExtractRequest):
+    """Test endpoint - downloads PDF and returns first 10 voters, no Supabase needed"""
+    logger.info(f"TEST extract request: {req.pdf_url}")
+
+    # Download PDF
+    try:
+        response = requests.get(req.pdf_url, timeout=120)
+        response.raise_for_status()
+        logger.info(f"Downloaded {len(response.content)} bytes")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+
+    # Save to temp file
+    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
+
+    try:
+        voters = extract_voters_from_pdf(tmp_path)
+        return {
+            "success": True,
+            "total_voters_found": len(voters),
+            "total_precincts": len(set(v['precinct_no'] for v in voters)),
+            "sample_voters": voters[:10],
+            "message": f"Successfully extracted {len(voters)} voters!"
+        }
+    except Exception as e:
+        logger.error(f"Extraction error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 @app.post("/extract")
 async def extract(req: ExtractRequest):
     # Download PDF from Supabase storage
