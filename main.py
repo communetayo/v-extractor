@@ -190,21 +190,147 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
         response.raise_for_status()
         logger.info(f"Downloaded {len(response.content)} bytes")
 
-        # Save temp file
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
             tmp.write(response.content)
             tmp_path = tmp.name
 
-        # Extract voters
-        voters = extract_voters_from_pdf(tmp_path)
-        logger.info(f"Extracted {len(voters)} voters")
+        PRECINCT_RE = re.compile(r'Prec\s*:\s*(\S+)', re.IGNORECASE)
+        NAME_COL_MAX_X = 370
+        MARKER_MAP = {'*': 'youth', 'A': 'illiterate', 'B': 'pwd', 'C': 'senior'}
 
-        # Insert to Supabase
-        insert_to_supabase(voters, pdf_upload_id, supabase_url, supabase_key)
+        headers = {
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        }
+
+        current_precinct = ''
+        province = ''
+        city = ''
+        barangay = ''
+        total_inserted = 0
+        BATCH_SIZE = 50  # pages per batch
+        PAGE_INSERT_SIZE = 100  # voters per insert
+
+        with pdfplumber.open(tmp_path) as pdf:
+            total_pages = len(pdf.pages)
+            logger.info(f"Total pages: {total_pages}")
+
+            # Process 50 pages at a time
+            for batch_start in range(0, total_pages, BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, total_pages)
+                batch_voters = []
+
+                for page_num in range(batch_start, batch_end):
+                    page = pdf.pages[page_num]
+                    text = page.extract_text() or ''
+
+                    # Get header info from page 0
+                    if page_num == 0:
+                        for line in text.split('\n'):
+                            if 'PROVINCE :' in line:
+                                province = title_case(line.split('PROVINCE :')[-1].strip())
+                            elif 'CITY / MUNICIPALITY :' in line:
+                                city = title_case(line.split('CITY / MUNICIPALITY :')[-1].strip())
+                            elif 'BARANGAY :' in line:
+                                barangay = title_case(line.split('BARANGAY :')[-1].strip())
+
+                    prec = PRECINCT_RE.search(text)
+                    if prec:
+                        current_precinct = prec.group(1).strip()
+
+                    words = page.extract_words(keep_blank_chars=False)
+                    if not words:
+                        continue
+
+                    lines_dict = {}
+                    for w in words:
+                        y_key = round(w['top'] / 3) * 3
+                        if y_key not in lines_dict:
+                            lines_dict[y_key] = []
+                        lines_dict[y_key].append(w)
+
+                    for y_key in sorted(lines_dict.keys()):
+                        line_words = sorted(lines_dict[y_key], key=lambda w: w['x0'])
+                        if not line_words[0]['text'].isdigit():
+                            continue
+
+                        voter_no = int(line_words[0]['text'])
+                        name_words = []
+                        addr_words = []
+                        marker = ''
+
+                        for w in line_words[1:]:
+                            txt = w['text']
+                            x = w['x0']
+                            if x < NAME_COL_MAX_X:
+                                if txt in ('*', 'A', 'B', 'C') and not name_words:
+                                    marker = txt
+                                else:
+                                    name_words.append(txt)
+                            else:
+                                addr_words.append(txt)
+
+                        if not name_words:
+                            continue
+
+                        full_name = ' '.join(name_words)
+                        last_name, first_name, middle_name = parse_name(full_name)
+
+                        batch_voters.append({
+                            'voter_no': voter_no,
+                            'precinct_no': current_precinct,
+                            'last_name': last_name,
+                            'first_name': first_name,
+                            'middle_name': middle_name,
+                            'address': title_case(' '.join(addr_words)),
+                            'barangay': barangay,
+                            'city': city,
+                            'province': province,
+                            'voter_category': MARKER_MAP.get(marker, 'regular'),
+                            'survey_status': 'pending',
+                            'pdf_upload_id': pdf_upload_id
+                        })
+
+                # Insert this batch to Supabase immediately
+                for i in range(0, len(batch_voters), PAGE_INSERT_SIZE):
+                    insert_batch = batch_voters[i:i + PAGE_INSERT_SIZE]
+                    try:
+                        res = requests.post(
+                            f"{supabase_url}/rest/v1/voters_list",
+                            json=insert_batch,
+                            headers=headers,
+                            timeout=30
+                        )
+                        if res.status_code in (200, 201):
+                            total_inserted += len(insert_batch)
+                        else:
+                            logger.error(f"Insert error: {res.status_code} - {res.text[:200]}")
+                    except Exception as e:
+                        logger.error(f"Insert exception: {str(e)}")
+
+                logger.info(f"Pages {batch_start}-{batch_end} done — total inserted: {total_inserted}")
+
+                # Free memory explicitly
+                del batch_voters
+
+        # Update status to completed
+        requests.patch(
+            f"{supabase_url}/rest/v1/pdf_uploads?id=eq.{pdf_upload_id}",
+            json={
+                "status": "completed",
+                "records_count": total_inserted,
+                "progress": 1.0,
+            },
+            headers=headers,
+            timeout=30
+        )
+
+        logger.info(f"COMPLETE! Total inserted: {total_inserted}")
 
     except Exception as e:
         logger.error(f"Background job error: {str(e)}")
-        # Update status to error
         try:
             headers = {
                 "apikey": supabase_key,
