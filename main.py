@@ -213,147 +213,26 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
             "Prefer": "return=minimal"
         }
 
-       # Get total pages
+        # Get total pages
         with pdfplumber.open(tmp_path) as pdf:
             total_pages = len(pdf.pages)
         logger.info(f"Total pages: {total_pages}")
 
+        # State preserved across batches
         current_precinct = ''
         province = ''
         city = ''
         barangay = ''
+        BATCH_SIZE = 25  # pages per batch
         PAGE_INSERT_SIZE = 100
-        batch_voters = []
 
-        # Process page by page — keep precinct context!
-        with pdfplumber.open(tmp_path) as pdf:
-            for page_num, page in enumerate(pdf.pages):
-                text = page.extract_text() or ''
+        def insert_voters(voters_batch):
+            nonlocal total_in_pdf, total_inserted, total_duplicates, total_errors
 
-                # Header info from first page only
-                if page_num == 0:
-                    for line in text.split('\n'):
-                        if 'PROVINCE :' in line:
-                            province = title_case(
-                                line.split('PROVINCE :')[-1].strip())
-                        elif 'CITY / MUNICIPALITY :' in line:
-                            city = title_case(
-                                line.split('CITY / MUNICIPALITY :')[-1].strip())
-                        elif 'BARANGAY :' in line:
-                            barangay = title_case(
-                                line.split('BARANGAY :')[-1].strip())
-
-                # Always track precinct changes
-                prec = PRECINCT_RE.search(text)
-                if prec:
-                    current_precinct = prec.group(1).strip()
-
-                words = page.extract_words(keep_blank_chars=False)
-                if not words:
-                    continue
-
-                lines_dict = {}
-                for w in words:
-                    y_key = round(w['top'] / 3) * 3
-                    if y_key not in lines_dict:
-                        lines_dict[y_key] = []
-                    lines_dict[y_key].append(w)
-
-                for y_key in sorted(lines_dict.keys()):
-                    line_words = sorted(
-                        lines_dict[y_key], key=lambda w: w['x0'])
-                    if not line_words[0]['text'].isdigit():
-                        continue
-
-                    voter_no = int(line_words[0]['text'])
-                    name_words = []
-                    addr_words = []
-                    marker = ''
-
-                    for w in line_words[1:]:
-                        txt = w['text']
-                        x = w['x0']
-                        if x < NAME_COL_MAX_X:
-                            if txt in ('*', 'A', 'B', 'C') and not name_words:
-                                marker = txt
-                            else:
-                                name_words.append(txt)
-                        else:
-                            addr_words.append(txt)
-
-                    if not name_words:
-                        continue
-
-                    full_name = ' '.join(name_words)
-                    last_name, first_name, middle_name = parse_name(full_name)
-
-                    batch_voters.append({
-                        'voter_no': voter_no,
-                        'precinct_no': current_precinct,
-                        'last_name': last_name,
-                        'first_name': first_name,
-                        'middle_name': middle_name,
-                        'address': title_case(' '.join(addr_words)),
-                        'barangay': barangay,
-                        'city': city,
-                        'province': province,
-                        'voter_category': MARKER_MAP.get(marker, 'regular'),
-                        'survey_status': 'pending',
-                        'pdf_upload_id': pdf_upload_id
-                    })
-
-                # Insert every 200 voters to keep memory low
-                if len(batch_voters) >= 200:
-                    for i in range(0, len(batch_voters), PAGE_INSERT_SIZE):
-                        insert_batch = batch_voters[i:i + PAGE_INSERT_SIZE]
-                        total_in_pdf += len(insert_batch)
-                        try:
-                            res = requests.post(
-                                f"{supabase_url}/rest/v1/voters_list",
-                                json=insert_batch,
-                                headers=headers,
-                                timeout=30
-                            )
-                            if res.status_code in (200, 201):
-                                total_inserted += len(insert_batch)
-                            elif res.status_code == 409:
-                                for voter in insert_batch:
-                                    try:
-                                        single = requests.post(
-                                            f"{supabase_url}/rest/v1/voters_list",
-                                            json=voter,
-                                            headers=headers,
-                                            timeout=10
-                                        )
-                                        if single.status_code in (200, 201):
-                                            total_inserted += 1
-                                        elif single.status_code == 409:
-                                            total_duplicates += 1
-                                            if len(duplicate_details) < 100:
-                                                duplicate_details.append({
-                                                    "precinct": voter.get("precinct_no"),
-                                                    "voter_no": voter.get("voter_no"),
-                                                    "name": f"{voter.get('last_name')}, {voter.get('first_name')}"
-                                                })
-                                        else:
-                                            total_errors += 1
-                                    except Exception as e:
-                                        total_errors += 1
-                            else:
-                                total_errors += len(insert_batch)
-                        except Exception as e:
-                            total_errors += len(insert_batch)
-
-                    logger.info(f"Page {page_num+1}/{total_pages} — inserted: {total_inserted} dupes: {total_duplicates}")
-                    batch_voters = []
-                    import gc
-                    gc.collect()
-
-        # Insert remaining voters
-        if batch_voters:
-            for i in range(0, len(batch_voters), PAGE_INSERT_SIZE):
-                insert_batch = batch_voters[i:i + PAGE_INSERT_SIZE]
+            for i in range(0, len(voters_batch), PAGE_INSERT_SIZE):
+                insert_batch = voters_batch[i:i + PAGE_INSERT_SIZE]
                 total_in_pdf += len(insert_batch)
+
                 try:
                     res = requests.post(
                         f"{supabase_url}/rest/v1/voters_list",
@@ -361,9 +240,12 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                         headers=headers,
                         timeout=30
                     )
+
                     if res.status_code in (200, 201):
                         total_inserted += len(insert_batch)
+
                     elif res.status_code == 409:
+                        # Has duplicates — insert one by one
                         for voter in insert_batch:
                             try:
                                 single = requests.post(
@@ -376,17 +258,136 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                                     total_inserted += 1
                                 elif single.status_code == 409:
                                     total_duplicates += 1
+                                    if len(duplicate_details) < 100:
+                                        duplicate_details.append({
+                                            "precinct": voter.get("precinct_no"),
+                                            "voter_no": voter.get("voter_no"),
+                                            "name": f"{voter.get('last_name')}, {voter.get('first_name')}"
+                                        })
                                 else:
                                     total_errors += 1
-                            except:
+                                    if len(error_details) < 50:
+                                        error_details.append({
+                                            "precinct": voter.get("precinct_no"),
+                                            "voter_no": voter.get("voter_no"),
+                                            "error": single.text[:100]
+                                        })
+                            except Exception as e:
                                 total_errors += 1
                     else:
                         total_errors += len(insert_batch)
+                        if len(error_details) < 50:
+                            error_details.append({
+                                "error": res.text[:100]
+                            })
+
                 except Exception as e:
                     total_errors += len(insert_batch)
+                    if len(error_details) < 50:
+                        error_details.append({"error": str(e)})
 
-            logger.info(f"Final batch — inserted: {total_inserted}")
-            
+        # Process in batches — save precinct state between batches!
+        for batch_start in range(0, total_pages, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_pages)
+            batch_voters = []
+
+            # Open PDF fresh each batch (memory management)
+            # current_precinct is preserved from previous batch!
+            with pdfplumber.open(tmp_path) as pdf:
+                for page_num in range(batch_start, batch_end):
+                    page = pdf.pages[page_num]
+                    text = page.extract_text() or ''
+
+                    # Get header only from very first page
+                    if page_num == 0:
+                        for line in text.split('\n'):
+                            if 'PROVINCE :' in line:
+                                province = title_case(
+                                    line.split('PROVINCE :')[-1].strip())
+                            elif 'CITY / MUNICIPALITY :' in line:
+                                city = title_case(
+                                    line.split('CITY / MUNICIPALITY :')[-1].strip())
+                            elif 'BARANGAY :' in line:
+                                barangay = title_case(
+                                    line.split('BARANGAY :')[-1].strip())
+
+                    # Update precinct if found on this page
+                    # If NOT found, current_precinct stays from previous page!
+                    prec = PRECINCT_RE.search(text)
+                    if prec:
+                        current_precinct = prec.group(1).strip()
+
+                    words = page.extract_words(keep_blank_chars=False)
+                    if not words:
+                        continue
+
+                    lines_dict = {}
+                    for w in words:
+                        y_key = round(w['top'] / 3) * 3
+                        if y_key not in lines_dict:
+                            lines_dict[y_key] = []
+                        lines_dict[y_key].append(w)
+
+                    for y_key in sorted(lines_dict.keys()):
+                        line_words = sorted(
+                            lines_dict[y_key], key=lambda w: w['x0'])
+                        if not line_words[0]['text'].isdigit():
+                            continue
+
+                        voter_no = int(line_words[0]['text'])
+                        name_words = []
+                        addr_words = []
+                        marker = ''
+
+                        for w in line_words[1:]:
+                            txt = w['text']
+                            x = w['x0']
+                            if x < NAME_COL_MAX_X:
+                                if txt in ('*', 'A', 'B', 'C') and not name_words:
+                                    marker = txt
+                                else:
+                                    name_words.append(txt)
+                            else:
+                                addr_words.append(txt)
+
+                        if not name_words:
+                            continue
+
+                        full_name = ' '.join(name_words)
+                        last_name, first_name, middle_name = parse_name(full_name)
+
+                        batch_voters.append({
+                            'voter_no': voter_no,
+                            'precinct_no': current_precinct,
+                            'last_name': last_name,
+                            'first_name': first_name,
+                            'middle_name': middle_name,
+                            'address': title_case(' '.join(addr_words)),
+                            'barangay': barangay,
+                            'city': city,
+                            'province': province,
+                            'voter_category': MARKER_MAP.get(marker, 'regular'),
+                            'survey_status': 'pending',
+                            'pdf_upload_id': pdf_upload_id
+                        })
+
+            # PDF is now CLOSED — memory freed!
+            # Insert this batch
+            if batch_voters:
+                insert_voters(batch_voters)
+
+            logger.info(
+                f"Pages {batch_start}-{batch_end} done — "
+                f"inserted: {total_inserted} "
+                f"dupes: {total_duplicates} "
+                f"precinct: {current_precinct}"
+            )
+
+            # Force garbage collection
+            del batch_voters
+            import gc
+            gc.collect()
+
         # Log final report
         logger.info(f"""
 EXTRACTION REPORT:
@@ -479,7 +480,11 @@ EXTRACTION REPORT:
             timeout=30
         )
 
-        logger.info(f"COMPLETE! Inserted: {total_inserted} Dupes: {total_duplicates}")
+        logger.info(
+            f"COMPLETE! Inserted: {total_inserted} "
+            f"Dupes: {total_duplicates} "
+            f"Errors: {total_errors}"
+        )
 
     except Exception as e:
         logger.error(f"Background job error: {str(e)}")
