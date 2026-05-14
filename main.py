@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 import pdfplumber
 import requests
@@ -6,6 +6,7 @@ import tempfile
 import os
 import re
 import logging
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -54,10 +55,12 @@ def extract_voters_from_pdf(pdf_path):
     barangay = ''
 
     with pdfplumber.open(pdf_path) as pdf:
+        total_pages = len(pdf.pages)
+        logger.info(f"Processing {total_pages} pages...")
+
         for page_num, page in enumerate(pdf.pages):
             text = page.extract_text() or ''
 
-            # Extract header info from first page
             if page_num == 0:
                 for line in text.split('\n'):
                     if 'PROVINCE :' in line:
@@ -67,17 +70,14 @@ def extract_voters_from_pdf(pdf_path):
                     elif 'BARANGAY :' in line:
                         barangay = title_case(line.split('BARANGAY :')[-1].strip())
 
-            # Get precinct number
             prec = PRECINCT_RE.search(text)
             if prec:
                 current_precinct = prec.group(1).strip()
 
-            # Extract using word bounding boxes
             words = page.extract_words(keep_blank_chars=False)
             if not words:
                 continue
 
-            # Group words by vertical position
             lines_dict = {}
             for w in words:
                 y_key = round(w['top'] / 3) * 3
@@ -88,7 +88,6 @@ def extract_voters_from_pdf(pdf_path):
             for y_key in sorted(lines_dict.keys()):
                 line_words = sorted(lines_dict[y_key], key=lambda w: w['x0'])
 
-                # Must start with a number
                 if not line_words[0]['text'].isdigit():
                     continue
 
@@ -129,7 +128,103 @@ def extract_voters_from_pdf(pdf_path):
                     'survey_status': 'pending'
                 })
 
+            if (page_num + 1) % 100 == 0:
+                logger.info(f"Page {page_num+1}/{total_pages} — {len(voters)} voters")
+
     return voters
+
+def insert_to_supabase(voters, pdf_upload_id, supabase_url, supabase_key):
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal"
+    }
+
+    total_inserted = 0
+    batch_size = 100
+
+    for i in range(0, len(voters), batch_size):
+        batch = voters[i:i + batch_size]
+        for v in batch:
+            v['pdf_upload_id'] = pdf_upload_id
+        try:
+            res = requests.post(
+                f"{supabase_url}/rest/v1/voters_list",
+                json=batch,
+                headers=headers,
+                timeout=30
+            )
+            if res.status_code in (200, 201):
+                total_inserted += len(batch)
+                logger.info(f"Inserted batch {i//batch_size + 1} — total: {total_inserted}")
+            else:
+                logger.error(f"Insert error: {res.status_code} - {res.text[:200]}")
+        except Exception as e:
+            logger.error(f"Insert exception: {str(e)}")
+
+    # Update pdf_uploads status
+    try:
+        update_res = requests.patch(
+            f"{supabase_url}/rest/v1/pdf_uploads?id=eq.{pdf_upload_id}",
+            json={
+                "status": "completed",
+                "records_count": total_inserted,
+                "progress": 1.0,
+            },
+            headers=headers,
+            timeout=30
+        )
+        logger.info(f"Status update: {update_res.status_code}")
+    except Exception as e:
+        logger.error(f"Status update error: {str(e)}")
+
+    logger.info(f"COMPLETE! Total inserted: {total_inserted}")
+
+def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
+    logger.info(f"Background job started for: {pdf_upload_id}")
+    tmp_path = None
+    try:
+        # Download PDF
+        response = requests.get(pdf_url, timeout=120)
+        response.raise_for_status()
+        logger.info(f"Downloaded {len(response.content)} bytes")
+
+        # Save temp file
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
+
+        # Extract voters
+        voters = extract_voters_from_pdf(tmp_path)
+        logger.info(f"Extracted {len(voters)} voters")
+
+        # Insert to Supabase
+        insert_to_supabase(voters, pdf_upload_id, supabase_url, supabase_key)
+
+    except Exception as e:
+        logger.error(f"Background job error: {str(e)}")
+        # Update status to error
+        try:
+            headers = {
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {supabase_key}",
+                "Content-Type": "application/json"
+            }
+            requests.patch(
+                f"{supabase_url}/rest/v1/pdf_uploads?id=eq.{pdf_upload_id}",
+                json={"status": "error", "error_message": str(e)},
+                headers=headers,
+                timeout=10
+            )
+        except:
+            pass
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
 
 class ExtractRequest(BaseModel):
     pdf_url: str
@@ -137,108 +232,114 @@ class ExtractRequest(BaseModel):
     supabase_url: str
     supabase_key: str
 
-@app.get("/")
-def health_check():
-    return {"status": "ok", "service": "v-extractor"}
 class TestExtractRequest(BaseModel):
     pdf_url: str
 
+@app.get("/")
+def health_check():
+    return {"status": "ok", "service": "v-extractor"}
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/test-extract")
 async def test_extract(req: TestExtractRequest):
-    """Test endpoint - downloads PDF and returns first 10 voters, no Supabase needed"""
-    logger.info(f"TEST extract request: {req.pdf_url}")
-
-    # Download PDF
+    """Test endpoint - no Supabase needed, returns first 10 voters"""
+    logger.info(f"TEST extract: {req.pdf_url}")
     try:
         response = requests.get(req.pdf_url, timeout=120)
         response.raise_for_status()
-        logger.info(f"Downloaded {len(response.content)} bytes")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
 
-    # Save to temp file
     with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
         tmp.write(response.content)
         tmp_path = tmp.name
 
     try:
-        voters = extract_voters_from_pdf(tmp_path)
+        # Only process first 20 pages for quick test
+        voters = []
+        PRECINCT_RE = re.compile(r'Prec\s*:\s*(\S+)', re.IGNORECASE)
+        NAME_COL_MAX_X = 370
+        MARKER_MAP = {'*': 'youth', 'A': 'illiterate', 'B': 'pwd', 'C': 'senior'}
+        current_precinct = ''
+
+        with pdfplumber.open(tmp_path) as pdf:
+            for page_num, page in enumerate(pdf.pages[:20]):
+                text = page.extract_text() or ''
+                prec = PRECINCT_RE.search(text)
+                if prec:
+                    current_precinct = prec.group(1).strip()
+                words = page.extract_words(keep_blank_chars=False)
+                if not words:
+                    continue
+                lines_dict = {}
+                for w in words:
+                    y_key = round(w['top'] / 3) * 3
+                    if y_key not in lines_dict:
+                        lines_dict[y_key] = []
+                    lines_dict[y_key].append(w)
+                for y_key in sorted(lines_dict.keys()):
+                    line_words = sorted(lines_dict[y_key], key=lambda w: w['x0'])
+                    if not line_words[0]['text'].isdigit():
+                        continue
+                    voter_no = int(line_words[0]['text'])
+                    name_words = []
+                    addr_words = []
+                    marker = ''
+                    for w in line_words[1:]:
+                        txt = w['text']
+                        x = w['x0']
+                        if x < NAME_COL_MAX_X:
+                            if txt in ('*', 'A', 'B', 'C') and not name_words:
+                                marker = txt
+                            else:
+                                name_words.append(txt)
+                        else:
+                            addr_words.append(txt)
+                    if not name_words:
+                        continue
+                    full_name = ' '.join(name_words)
+                    last_name, first_name, middle_name = parse_name(full_name)
+                    voters.append({
+                        'voter_no': voter_no,
+                        'precinct_no': current_precinct,
+                        'last_name': last_name,
+                        'first_name': first_name,
+                        'middle_name': middle_name,
+                        'address': title_case(' '.join(addr_words)),
+                    })
+
         return {
             "success": True,
-            "total_voters_found": len(voters),
-            "total_precincts": len(set(v['precinct_no'] for v in voters)),
-            "sample_voters": voters[:10],
-            "message": f"Successfully extracted {len(voters)} voters!"
+            "voters_from_first_20_pages": len(voters),
+            "sample": voters[:10],
+            "message": f"Test successful! Found {len(voters)} voters in first 20 pages."
         }
-    except Exception as e:
-        logger.error(f"Extraction error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         try:
             os.unlink(tmp_path)
         except:
             pass
+
 @app.post("/extract")
-async def extract(req: ExtractRequest):
-    # Download PDF from Supabase storage
-    try:
-        response = requests.get(req.pdf_url, timeout=60)
-        response.raise_for_status()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {str(e)}")
+async def extract(req: ExtractRequest, background_tasks: BackgroundTasks):
+    """Main extract endpoint - runs in background, returns immediately"""
+    logger.info(f"Extract request for: {req.pdf_upload_id}")
 
-    # Save to temp file
-    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-        tmp.write(response.content)
-        tmp_path = tmp.name
+    # Start background processing
+    background_tasks.add_task(
+        process_in_background,
+        req.pdf_url,
+        req.pdf_upload_id,
+        req.supabase_url,
+        req.supabase_key
+    )
 
-    try:
-        # Extract voters
-        voters = extract_voters_from_pdf(tmp_path)
-
-        if not voters:
-            return {
-                "success": False,
-                "records_extracted": 0,
-                "message": "No voters found in PDF"
-            }
-
-        # Insert to Supabase in batches of 100
-        headers = {
-            "apikey": req.supabase_key,
-            "Authorization": f"Bearer {req.supabase_key}",
-            "Content-Type": "application/json",
-            "Prefer": "return=minimal"
-        }
-
-        total_inserted = 0
-        batch_size = 100
-        errors = []
-
-        for i in range(0, len(voters), batch_size):
-            batch = voters[i:i + batch_size]
-            for v in batch:
-                v['pdf_upload_id'] = req.pdf_upload_id
-
-            res = requests.post(
-                f"{req.supabase_url}/rest/v1/voters_list",
-                json=batch,
-                headers=headers,
-                timeout=30
-            )
-
-            if res.status_code in (200, 201):
-                total_inserted += len(batch)
-            else:
-                errors.append(f"Batch {i}: {res.text[:100]}")
-
-        return {
-            "success": True,
-            "records_extracted": len(voters),
-            "records_inserted": total_inserted,
-            "errors": errors[:3] if errors else [],
-            "message": f"Extracted {len(voters)} voters, inserted {total_inserted}"
-        }
-
-    finally:
-        os.unlink(tmp_path)
+    # Return immediately — processing continues in background
+    return {
+        "success": True,
+        "message": "Extraction started in background",
+        "pdf_upload_id": req.pdf_upload_id
+    }
