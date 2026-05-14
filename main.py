@@ -185,7 +185,6 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
     logger.info(f"Background job started for: {pdf_upload_id}")
     tmp_path = None
     try:
-        # Download PDF
         response = requests.get(pdf_url, timeout=120)
         response.raise_for_status()
         logger.info(f"Downloaded {len(response.content)} bytes")
@@ -205,28 +204,28 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
             "Prefer": "return=minimal"
         }
 
+        # Get total pages first
+        with pdfplumber.open(tmp_path) as pdf:
+            total_pages = len(pdf.pages)
+        logger.info(f"Total pages: {total_pages}")
+
+        total_inserted = 0
         current_precinct = ''
         province = ''
         city = ''
         barangay = ''
-        total_inserted = 0
-        BATCH_SIZE = 50  # pages per batch
-        PAGE_INSERT_SIZE = 100  # voters per insert
+        BATCH_SIZE = 30  # smaller batches = less memory
 
-        with pdfplumber.open(tmp_path) as pdf:
-            total_pages = len(pdf.pages)
-            logger.info(f"Total pages: {total_pages}")
+        for batch_start in range(0, total_pages, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_pages)
+            batch_voters = []
 
-            # Process 50 pages at a time
-            for batch_start in range(0, total_pages, BATCH_SIZE):
-                batch_end = min(batch_start + BATCH_SIZE, total_pages)
-                batch_voters = []
-
+            # Open and close PDF fresh for each batch
+            with pdfplumber.open(tmp_path) as pdf:
                 for page_num in range(batch_start, batch_end):
                     page = pdf.pages[page_num]
                     text = page.extract_text() or ''
 
-                    # Get header info from page 0
                     if page_num == 0:
                         for line in text.split('\n'):
                             if 'PROVINCE :' in line:
@@ -252,7 +251,8 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                         lines_dict[y_key].append(w)
 
                     for y_key in sorted(lines_dict.keys()):
-                        line_words = sorted(lines_dict[y_key], key=lambda w: w['x0'])
+                        line_words = sorted(
+                            lines_dict[y_key], key=lambda w: w['x0'])
                         if not line_words[0]['text'].isdigit():
                             continue
 
@@ -293,29 +293,31 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                             'pdf_upload_id': pdf_upload_id
                         })
 
-                # Insert this batch to Supabase immediately
-                for i in range(0, len(batch_voters), PAGE_INSERT_SIZE):
-                    insert_batch = batch_voters[i:i + PAGE_INSERT_SIZE]
-                    try:
-                        res = requests.post(
-                            f"{supabase_url}/rest/v1/voters_list",
-                            json=insert_batch,
-                            headers=headers,
-                            timeout=30
-                        )
-                        if res.status_code in (200, 201):
-                            total_inserted += len(insert_batch)
-                        else:
-                            logger.error(f"Insert error: {res.status_code} - {res.text[:200]}")
-                    except Exception as e:
-                        logger.error(f"Insert exception: {str(e)}")
+            # Insert batch to Supabase
+            for i in range(0, len(batch_voters), 100):
+                insert_batch = batch_voters[i:i + 100]
+                try:
+                    res = requests.post(
+                        f"{supabase_url}/rest/v1/voters_list",
+                        json=insert_batch,
+                        headers=headers,
+                        timeout=30
+                    )
+                    if res.status_code in (200, 201):
+                        total_inserted += len(insert_batch)
+                    else:
+                        logger.error(f"Insert error: {res.status_code} - {res.text[:200]}")
+                except Exception as e:
+                    logger.error(f"Insert exception: {str(e)}")
 
-                logger.info(f"Pages {batch_start}-{batch_end} done — total inserted: {total_inserted}")
+            logger.info(f"Pages {batch_start}-{batch_end} done — total: {total_inserted}")
 
-                # Free memory explicitly
-                del batch_voters
+            # Force garbage collection
+            del batch_voters
+            import gc
+            gc.collect()
 
-        # Update status to completed
+        # Mark completed
         requests.patch(
             f"{supabase_url}/rest/v1/pdf_uploads?id=eq.{pdf_upload_id}",
             json={
@@ -326,7 +328,6 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
             headers=headers,
             timeout=30
         )
-
         logger.info(f"COMPLETE! Total inserted: {total_inserted}")
 
     except Exception as e:
@@ -351,7 +352,7 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                 os.unlink(tmp_path)
             except:
                 pass
-
+                
 class ExtractRequest(BaseModel):
     pdf_url: str
     pdf_upload_id: str
