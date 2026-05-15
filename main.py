@@ -223,6 +223,7 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
         province = ''
         city = ''
         barangay = ''
+        election_year = 2023  # default, overridden from PDF
         BATCH_SIZE = 25  # pages per batch
         PAGE_INSERT_SIZE = 100
 
@@ -300,16 +301,27 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
 
                     # Get header only from very first page
                     if page_num == 0:
-                        for line in text.split('\n'):
-                            if 'PROVINCE :' in line:
-                                province = title_case(
-                                    line.split('PROVINCE :')[-1].strip())
-                            elif 'CITY / MUNICIPALITY :' in line:
-                                city = title_case(
-                                    line.split('CITY / MUNICIPALITY :')[-1].strip())
-                            elif 'BARANGAY :' in line:
-                                barangay = title_case(
-                                    line.split('BARANGAY :')[-1].strip())
+                    for line in text.split('\n'):
+                        if 'PROVINCE :' in line:
+                            province = title_case(
+                                line.split('PROVINCE :')[-1].strip())
+                        elif 'CITY / MUNICIPALITY :' in line:
+                            city = title_case(
+                                line.split('CITY / MUNICIPALITY :')[-1].strip())
+                        elif 'BARANGAY :' in line:
+                            barangay = title_case(
+                                line.split('BARANGAY :')[-1].strip())
+                        else:
+                            # Extract election year from header line
+                            year_match = re.search(r'(20\d{2})', line)
+                            if year_match:
+                                extracted_year = int(year_match.group(1))
+                                # Valid election years only
+                                if extracted_year in [
+                                    2019, 2022, 2023, 
+                                    2025, 2026, 2028
+                                ]:
+                                    election_year = extracted_year
 
                     # Update precinct if found on this page
                     # If NOT found, current_precinct stays from previous page!
@@ -369,6 +381,7 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                             'voter_category': MARKER_MAP.get(marker, 'regular'),
                             'survey_status': 'pending',
                             'pdf_upload_id': pdf_upload_id
+                            'election_year': election_year,
                         })
 
             # PDF is now CLOSED — memory freed!
@@ -496,7 +509,9 @@ EXTRACTION REPORT:
                 "total_inserted": total_inserted,
                 "total_duplicates": total_duplicates,
                 "total_errors": total_errors,
-                "total_precincts": distinct_precincts, 
+                "total_precincts": distinct_precincts,
+                "barangay": barangay,
+                "election_year": election_year,  # dynamic!
                 "duplicate_details": duplicate_details,
                 "error_details": error_details,
             },
