@@ -388,6 +388,29 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
             import gc
             gc.collect()
 
+# Count distinct precincts
+        try:
+            precinct_res = requests.get(
+                f"{supabase_url}/rest/v1/voters_list",
+                params={
+                    "pdf_upload_id": f"eq.{pdf_upload_id}",
+                    "select": "precinct_no",
+                },
+                headers=headers,
+                timeout=30
+            )
+            if precinct_res.status_code == 200:
+                all_precincts = precinct_res.json()
+                distinct_precincts = len(set(
+                    v['precinct_no'] for v in all_precincts
+                ))
+                logger.info(f"Distinct precincts: {distinct_precincts}")
+            else:
+                distinct_precincts = 0
+        except Exception as e:
+            logger.error(f"Precinct count error: {str(e)}")
+            distinct_precincts = 0
+        
         # Log final report
         logger.info(f"""
 EXTRACTION REPORT:
@@ -473,6 +496,7 @@ EXTRACTION REPORT:
                 "total_inserted": total_inserted,
                 "total_duplicates": total_duplicates,
                 "total_errors": total_errors,
+                "total_precincts": distinct_precincts, 
                 "duplicate_details": duplicate_details,
                 "error_details": error_details,
             },
