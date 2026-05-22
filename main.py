@@ -312,6 +312,18 @@ def process_in_background(pdf_url, pdf_upload_id, supabase_url, supabase_key):
                             barangay = title_case(
                                 line.split('BARANGAY :')[-1].strip())
                         else:
+                            year_match = re.search(r'(20\d{2})', line)
+                            if year_match:
+                                extracted_year = int(year_match.group(1))
+                                if extracted_year in [
+                                    2019, 2022, 2023,
+                                    2025, 2026, 2028
+                                ]:
+                                    election_year = extracted_year
+                        elif 'BARANGAY :' in line:
+                            barangay = title_case(
+                                line.split('BARANGAY :')[-1].strip())
+                        else:
                             # Extract election year from header line
                             year_match = re.search(r'(20\d{2})', line)
                             if year_match:
